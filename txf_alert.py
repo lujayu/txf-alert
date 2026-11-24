@@ -1,17 +1,25 @@
+import os
 import time
 import requests
 from collections import deque
 from datetime import datetime, timezone, timedelta
 
-# ================= 1. 參數設定區 =================
-TOKEN = "8324825861:AAFFlo8-B_6kB6cIbhvrVakQI5QpWqc6eRI"
-CHAT_ID = "9216134050"
+# ================= 1. 參數設定區（從 GitHub Secrets 加密讀取） =================
+TOKEN = os.environ["TG_TOKEN"]
+CHAT_ID = os.environ["TG_CHAT_ID"]
 
-THRESHOLD_POINTS = 100   # 觸發門檻：1 分鐘內波動超過 100 點
-WINDOW_SECONDS = 60      # 監控時間窗口：60 秒（1 分鐘）
-COOLDOWN_SECONDS = 60    # 警報冷卻時間：觸發後 60 秒內不重複發送同方向警報
-POLL_INTERVAL = 3        # 抓取頻率：每 3 秒查詢一次最新報價
-RUN_DURATION = 580       # 單次執行秒數：約 9 分 40 秒後交棒給下一班排程
+# 規則一：短線急波動（1 分鐘內波動超過 100 點）
+SHORT_WINDOW_SEC = 60      # 60 秒（1 分鐘）
+SHORT_THRESHOLD = 100      # 觸發門檻：100 點
+SHORT_COOLDOWN = 60        # 同方向警報冷卻時間：60 秒
+
+# 規則二：波段大行情（5 分鐘內波動超過 200 點）
+LONG_WINDOW_SEC = 300      # 300 秒（5 分鐘）
+LONG_THRESHOLD = 200       # 觸發門檻：200 點
+LONG_COOLDOWN = 180        # 同方向警報冷卻時間：180 秒（3 分鐘）
+
+POLL_INTERVAL = 3          # 抓取頻率：每 3 秒查詢一次最新報價
+RUN_DURATION = 580         # 單次執行秒數：約 9 分 40 秒後交棒給下一班排程
 
 TW_TZ = timezone(timedelta(hours=8))
 
@@ -22,7 +30,7 @@ def get_tw_now():
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TOKEN.strip()}/sendMessage"
     payload = {
-        "chat_id": CHAT_ID,
+        "chat_id": CHAT_ID.strip(),
         "text": message
     }
     try:
@@ -72,14 +80,18 @@ def get_txf_realtime_price():
         
     return None, None, None
 
-# ================= 4. 主監控迴圈 =================
+# ================= 4. 主監控迴圈（雙時間週期並行） =================
 def run_monitor():
+    # 保留最長 5 分鐘（300 秒）內的歷史報價
     price_history = deque()
-    last_alert_time = {"UP": 0, "DOWN": 0}
-    start_ts = time.time()
     
+    # 兩組條件各自獨立的冷卻計時器
+    last_alert_short = {"UP": 0, "DOWN": 0}
+    last_alert_long = {"UP": 0, "DOWN": 0}
+    
+    start_ts = time.time()
     start_str = get_tw_now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"🚀 [{start_str} 台灣時間] 雲端排程監控開始...", flush=True)
+    print(f"🚀 [{start_str} 台灣時間] 雙週期雲端排程監控開始（1分100點 / 5分200點）...", flush=True)
     
     while (time.time() - start_ts) < RUN_DURATION:
         price, contract, diff = get_txf_realtime_price()
@@ -88,41 +100,73 @@ def run_monitor():
         
         if price is not None:
             price_history.append((now_ts, price))
-            while price_history and (now_ts - price_history[0][0] > WINDOW_SECONDS):
+            # 清除超過 5 分鐘（LONG_WINDOW_SEC）的舊資料
+            while price_history and (now_ts - price_history[0][0] > LONG_WINDOW_SEC):
                 price_history.popleft()
             
-            prices_in_window = [p for _, p in price_history]
-            min_price = min(prices_in_window)
-            max_price = max(prices_in_window)
+            # --- 計算 1 分鐘內高低點 ---
+            short_prices = [p for ts, p in price_history if (now_ts - ts) <= SHORT_WINDOW_SEC]
+            s_min, s_max = min(short_prices), max(short_prices)
+            s_surge = price - s_min
+            s_plunge = s_max - price
             
-            surge = price - min_price
-            plunge = max_price - price
+            # --- 計算 5 分鐘內高低點 ---
+            long_prices = [p for _, p in price_history]
+            l_min, l_max = min(long_prices), max(long_prices)
+            l_surge = price - l_min
+            l_plunge = l_max - price
             
-            print(f"[{now_str}] {contract} 現價: {price:,.0f} | 1分內高低: {max_price:,.0f} / {min_price:,.0f}", flush=True)
+            print(
+                f"[{now_str}] {contract} 現價: {price:,.0f} | "
+                f"1分高低: {s_max:,.0f}/{s_min:,.0f} | 5分高低: {l_max:,.0f}/{l_min:,.0f}",
+                flush=True
+            )
             
-            # 急漲超過門檻
-            if surge >= THRESHOLD_POINTS and (now_ts - last_alert_time["UP"] > COOLDOWN_SECONDS):
+            # ================= 規則一：1 分鐘內波動 >= 100 點 =================
+            if s_surge >= SHORT_THRESHOLD and (now_ts - last_alert_short["UP"] > SHORT_COOLDOWN):
                 msg = (
-                    f"🔥【台指期急漲警報】🔥\n"
+                    f"🔥【台指期 1分鐘急漲警報】🔥\n"
                     f"合約：{contract}\n"
                     f"目前現價：{price:,.0f} 點\n"
-                    f"1 分鐘內急拉：+{surge:,.0f} 點（低點 {min_price:,.0f}）\n"
+                    f"1 分鐘內急拉：+{s_surge:,.0f} 點（低點 {s_min:,.0f}）\n"
                     f"台灣時間：{now_str}"
                 )
                 send_telegram_alert(msg)
-                last_alert_time["UP"] = now_ts
+                last_alert_short["UP"] = now_ts
                 
-            # 急跌超過門檻
-            if plunge >= THRESHOLD_POINTS and (now_ts - last_alert_time["DOWN"] > COOLDOWN_SECONDS):
+            if s_plunge >= SHORT_THRESHOLD and (now_ts - last_alert_short["DOWN"] > SHORT_COOLDOWN):
                 msg = (
-                    f"❄️【台指期急跌警報】❄️\n"
+                    f"❄️【台指期 1分鐘急跌警報】❄️\n"
                     f"合約：{contract}\n"
                     f"目前現價：{price:,.0f} 點\n"
-                    f"1 分鐘內急殺：-{plunge:,.0f} 點（高點 {max_price:,.0f}）\n"
+                    f"1 分鐘內急殺：-{s_plunge:,.0f} 點（高點 {s_max:,.0f}）\n"
                     f"台灣時間：{now_str}"
                 )
                 send_telegram_alert(msg)
-                last_alert_time["DOWN"] = now_ts
+                last_alert_short["DOWN"] = now_ts
+
+            # ================= 規則二：5 分鐘內波動 >= 200 點 =================
+            if l_surge >= LONG_THRESHOLD and (now_ts - last_alert_long["UP"] > LONG_COOLDOWN):
+                msg = (
+                    f"🚀🚀【台指期 5分鐘波段暴漲】🚀🚀\n"
+                    f"合約：{contract}\n"
+                    f"目前現價：{price:,.0f} 點\n"
+                    f"5 分鐘內大漲：+{l_surge:,.0f} 點（低點 {l_min:,.0f}）\n"
+                    f"台灣時間：{now_str}"
+                )
+                send_telegram_alert(msg)
+                last_alert_long["UP"] = now_ts
+                
+            if l_plunge >= LONG_THRESHOLD and (now_ts - last_alert_long["DOWN"] > LONG_COOLDOWN):
+                msg = (
+                    f"🌊🌊【台指期 5分鐘波段重挫】🌊🌊\n"
+                    f"合約：{contract}\n"
+                    f"目前現價：{price:,.0f} 點\n"
+                    f"5 分鐘內重挫：-{l_plunge:,.0f} 點（高點 {l_max:,.0f}）\n"
+                    f"台灣時間：{now_str}"
+                )
+                send_telegram_alert(msg)
+                last_alert_long["DOWN"] = now_ts
         else:
             print(f"[{now_str}] 目前無最新成交報價（休市或盤前）", flush=True)
             
